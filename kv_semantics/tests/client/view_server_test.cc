@@ -7,6 +7,14 @@
 namespace kv::test {
 namespace {
 
+GlobalView MakeView(std::uint64_t viewEpoch, std::vector<NodeId> nodeIds)
+{
+    GlobalView view;
+    view.viewEpoch = viewEpoch;
+    for (const auto nodeId : nodeIds) { view.asuMap.emplace(nodeId, NodeInfo{}); }
+    return view;
+}
+
 TEST(ViewServerTest, ConfigFileViewServerLoadsView)
 {
     constexpr const char* kConfigPath = "kv_client_view_server_test.conf";
@@ -65,6 +73,57 @@ TEST(ViewServerTest, ConfigBackedViewServerBuildsViewFromTransportConfigs)
     ASSERT_EQ(view.asuMap[10].endpoints.size(), std::size_t{1});
     EXPECT_EQ(view.asuMap[10].endpoints[0].ip, "127.0.0.1");
     EXPECT_EQ(view.asuMap[10].endpoints[0].protocol, Protocol::ROCE);
+}
+
+TEST(ViewServerTest, GetAllViewsAdaptsLegacyViewToDefaultNamespace)
+{
+    constexpr const char* kConfigPath = "kv_client_all_views_test.conf";
+    {
+        std::ofstream configFile{kConfigPath};
+        ASSERT_TRUE(configFile.is_open());
+        configFile << "viewEpoch=9\n";
+        configFile << "viewId=4\n";
+        configFile << "asuIds=10,20\n";
+    }
+
+    KvClientConfig config;
+    config.viewServiceAddrs = {kConfigPath};
+    auto viewServer = CreateDefaultViewServer(config);
+
+    ViewUniverse universe;
+    std::unordered_map<KvNsId, GlobalView> initialViews;
+    initialViews.emplace(kDefaultKvNsId, MakeView(8, {999}));
+    initialViews.emplace(77, MakeView(8, {888}));
+    ASSERT_TRUE(universe.ReplaceAll(ViewUniverse{std::move(initialViews), 99}).ok());
+
+    auto status = viewServer->GetAllViews(universe);
+    std::remove(kConfigPath);
+
+    ASSERT_TRUE(status.ok()) << status.message;
+    EXPECT_EQ(universe.GetGlobalEpoch(), std::uint64_t{9});
+    ASSERT_EQ(universe.GetAllNsIds(), (std::vector<KvNsId>{kDefaultKvNsId}));
+    GlobalView view;
+    ASSERT_TRUE(universe.GetView(kDefaultKvNsId, view).ok());
+    EXPECT_EQ(view.viewEpoch, std::uint64_t{9});
+    EXPECT_EQ(view.asuMap.size(), std::size_t{2});
+}
+
+TEST(ViewServerTest, GetAllViewsClearsOutputOnFailure)
+{
+    KvClientConfig config;
+    config.viewServiceAddrs = {"/path/that/does/not/exist"};
+    auto viewServer = CreateDefaultViewServer(config);
+
+    ViewUniverse universe;
+    std::unordered_map<KvNsId, GlobalView> initialViews;
+    initialViews.emplace(kDefaultKvNsId, MakeView(8, {999}));
+    ASSERT_TRUE(universe.ReplaceAll(ViewUniverse{std::move(initialViews), 8}).ok());
+
+    auto status = viewServer->GetAllViews(universe);
+
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(universe.Empty());
+    EXPECT_EQ(universe.GetGlobalEpoch(), std::uint64_t{0});
 }
 
 TEST(ViewServerTest, PublishAndRefreshPolicies)

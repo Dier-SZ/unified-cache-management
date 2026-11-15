@@ -119,6 +119,21 @@ GlobalView BuildConfigGlobalView(const KvClientConfig& config)
     return view;
 }
 
+Status ViewServer::GetAllViews(ViewUniverse& universe)
+{
+    universe.Clear();
+
+    GlobalView view;
+    auto status = GetGlobalView(view);
+    if (!status.ok()) { return status; }
+
+    const auto globalEpoch = view.viewEpoch;
+    std::unordered_map<KvNsId, GlobalView> views;
+    views.emplace(kDefaultKvNsId, std::move(view));
+    ViewUniverse nextUniverse(std::move(views), globalEpoch);
+    return universe.ReplaceAll(nextUniverse);
+}
+
 bool ViewServer::ShouldPublishView(const GlobalView& publishedView,
                                    const GlobalView& fetchedView) const
 {

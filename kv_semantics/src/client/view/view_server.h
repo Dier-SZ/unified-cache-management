@@ -29,19 +29,11 @@
 #include <unordered_map>
 #include <vector>
 #include "kv_transport.h"
+#include "view/view_universe.h"
 
 namespace kv {
 
 struct KvClientConfig;
-
-// GlobalView carries the routing membership and view metadata.
-struct GlobalView {
-    std::uint64_t viewEpoch{0};
-    std::uint64_t viewId{0};
-    std::unordered_map<NodeId, NodeInfo> asuMap;
-    std::uint64_t createTimeMs{0};
-    std::uint64_t expireTimeMs{0};
-};
 
 // ViewServer owns global view fetching and refresh decisions.
 class ViewServer {
@@ -50,6 +42,9 @@ public:
     virtual ~ViewServer() = default;
     // Fetches the current global view.
     virtual Status GetGlobalView(GlobalView& view) = 0;
+    // Fetches all namespace views. Legacy implementations only need to
+    // implement GetGlobalView; this default adapts that view to kDefaultKvNsId.
+    virtual Status GetAllViews(ViewUniverse& universe);
     // Returns whether a fetched view should replace the published view.
     virtual bool ShouldPublishView(const GlobalView& publishedView,
                                    const GlobalView& fetchedView) const;
