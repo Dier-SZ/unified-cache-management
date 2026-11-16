@@ -498,7 +498,7 @@ asuInfo.30=10.0.0.30:1000
 4. 任一 ns 没有 routable ASU，或 per-ns `viewEpoch` 大于 `globalEpoch`：返回失败，保留旧 universe。
 5. 校验通过后，一次性替换 `views_` 和 `globalEpoch_`。
 
-per-ns 快照的构建和提交属于 Shard 7 的 `KvClientImpl` 集成：
+per-ns 快照的构建和提交属于 Shard 9/10 的 `KvClientImpl` 集成：
 
 1. RefreshScheduler 通过 `ViewServer::GetAllViews()` 拉到完整候选 universe。
 2. `KvClientImpl` 对比新旧 universe，得到新增、变更和删除 ns。
@@ -633,7 +633,7 @@ return kInvalidNodeId / entry routing failure
 
 ### 5.11 IO 路径 nsId 传递
 
-外部 IO API 和 IO 命令携带 `KvNsId` 是本设计的前提，由其他开发者在外部分支实现。Shard 1 不修改 `ClientTask`、`TransportTask`、`ViewSnapshot` 和请求编码层的字段；Shard 7 再把这些字段接入多 ns 快照选择和协议构建。
+外部 IO API 和 IO 命令携带 `KvNsId` 是本设计的前提，由其他开发者在外部分支实现。Shard 1 不修改 `ClientTask`、`TransportTask`、`ViewSnapshot` 和请求编码层的字段；Shard 9 再把这些字段接入多 ns 快照选择和协议构建。
 
 外部 API 已携带 `KvNsId`，Client 内部需要按以下路径传递：
 
@@ -844,7 +844,7 @@ Worker 不加载 agent，不连接 Ceph，也不缓存 Master 的认证信息。
 - 提供 `GetView(nsId)`、`GetAllViews()`、`GetAllNsIds()`、`GetGlobalEpoch()` 和 `Empty()` 查询接口。
 - 不保存 pool name，不负责拉取外部视图，也不负责构建 transport 或 per-ns snapshot。
 
-per-ns `snapshots_`、全局 transport 池和快照提交顺序由 Shard 7 的 `KvClientImpl` 集成负责维护。
+per-ns `snapshots_`、全局 transport 池和快照提交顺序由 Shard 8/9/10 的 `KvClientImpl` 集成负责维护。
 
 ## 8. 业务交互流程图
 
@@ -1314,7 +1314,7 @@ view.config_path=/etc/ucm/asu-view.conf
 
 ## 13. 可独立开发 Shard 拆分
 
-M800 视图管理可以按以下 8 个 shard 并行开发。Shard 1 是所有功能 shard 的契约前置；Shard 8 是工程分支的最终集成收口，必须在 2 至 7 具备后进行。
+M800 视图管理可以按以下 11 个 shard 并行开发。Shard 1 是所有功能 shard 的契约前置；Shard 11 是工程分支的最终集成收口，必须在 2 至 10 具备后进行。
 
 | Shard | 职责 |
 | --- | --- |
@@ -1324,12 +1324,15 @@ M800 视图管理可以按以下 8 个 shard 并行开发。Shard 1 是所有功
 | 4. `M800ViewSlaveServer` + `M800ViewCodec` | 通过 HTTP 从 Master 拉取全量视图文本，并完成编码、解码、格式校验和 nsId 冲突检测。 |
 | 5. `ViewUniverse` | 维护 `KvNsId -> GlobalView` 二级映射，执行 epoch 校验、全量对齐、per-ns 查询和失败时保留旧视图。 |
 | 6. Refresh Scheduler | 以独立线程统一处理定时刷新、IO 失败触发和手动 `RefreshNow()`，保证刷新请求串行合并执行。 |
-| 7. `KvClientImpl` 集成 | 将多 ns 快照、RefreshScheduler、全局 transport 池和 DHT 二次哈希故障转移接入现有 IO 任务链路。 |
-| 8. 工程分支扩展 | 在 `CreateDefaultViewServer` 和配置入口识别 `view.provider=m800` 与 `view.role`，完成各 shard 的集成、构建和回归收口。 |
+| 7. `KvClientImpl` 路由与故障转移 | 扩展 `RingHashRouter` 的主环/次环、不可用节点集合和二次哈希 fallback，并在任务构建层接入健康判断。 |
+| 8. `KvClientImpl` 全局 Transport 池 | 引入 `NodeId -> AsuTransport` 常驻池、动态 transport 模板和 Shutdown 统一关闭，保持跨 ns 连接复用。 |
+| 9. `KvClientImpl` 多 ns 快照与 IO 传递 | 维护 `KvNsId -> ViewSnapshot`，把 `nsId` 从 Client task 传递到 Transport task 和协议请求，实现 per-ns 快照选择与旧 IO 保活。 |
+| 10. `KvClientImpl` 刷新与原子发布 | 接入 RefreshScheduler，拉取候选 universe，对比新旧视图并整体构建、校验、提交 per-ns 快照，失败时保留旧状态。 |
+| 11. 工程分支扩展 | 在 `CreateDefaultViewServer` 和配置入口识别 `view.provider=m800` 与 `view.role`，完成各 shard 的集成、构建和回归收口。 |
 
 ### 13.1 接口契约类图
 
-下图冻结 Shard 1 需要交付的接口与类型边界。`ViewSnapshot`、`TransportTask.nsId`、全局 transport 池、Router 次环和多 ns 快照提交属于 Shard 7 的实现契约，不在本图中作为 Shard 1 交付项出现。
+下图冻结 Shard 1 需要交付的接口与类型边界。`ViewSnapshot`、`TransportTask.nsId`、全局 transport 池、Router 次环和多 ns 快照提交属于 Shard 7/8/9/10 的实现契约，不在本图中作为 Shard 1 交付项出现。
 
 ```mermaid
 classDiagram
@@ -1574,7 +1577,7 @@ classDiagram
 - `ViewUniverse` 是线程安全的集群视图模块，直接拥有二级映射并对外提供更新和查询接口；不存在 `ViewUniverseStore` 契约。
 - `RefreshScheduler` 只依赖回调，不直接依赖 `ViewServer`，避免调度层耦合具体视图来源。
 - `Router::RouteKeys()` 增加不可用节点集合，是二次哈希故障转移的统一入口；RingHashRouter 的次环和次哈希实现留在 Shard 7。
-- Shard 1 不修改 `ViewSnapshot`、`ClientTask` 或 `TransportTask`；多 ns 快照和 IO `nsId` 传递由外部分支及 Shard 7 集成。
+- Shard 1 不修改 `ViewSnapshot`、`ClientTask` 或 `TransportTask`；多 ns 快照和 IO `nsId` 传递由外部分支及 Shard 9 集成。
 - `KVClientAgentCABI` 是 Master 与 agent 动态库之间的进程内 C 边界，所有数组都必须配 free 函数。
 - `M800ViewAgentClient` 是 C ABI 的 C++ 适配契约，负责把 C 数组转为 `std::vector` 并隐藏动态库生命周期。
 - `ViewHttpServer` 是 Master 的协议服务契约；请求处理函数只读缓存，不在 HTTP 线程内触发 Ceph 查询。
@@ -1589,8 +1592,11 @@ flowchart BT
     C4["4. M800ViewSlaveServer + M800ViewCodec"]
     C5["5. ViewUniverse"]
     C6["6. Refresh Scheduler"]
-    C7["7. KvClientImpl 集成"]
-    C8["8. 工程分支扩展"]
+    C7["7. 路由与故障转移"]
+    C8["8. 全局 Transport 池"]
+    C9["9. 多 ns 快照与 IO 传递"]
+    C10["10. 刷新与原子发布"]
+    C11["11. 工程分支扩展"]
 
     C2 --> C1
     C3 --> C1
@@ -1598,16 +1604,28 @@ flowchart BT
     C5 --> C1
     C6 --> C1
     C7 --> C1
-    C8 --> C2
-    C8 --> C3
-    C8 --> C4
-    C8 --> C5
-    C8 --> C6
-    C8 --> C7
+    C8 --> C1
+    C9 --> C1
+    C9 --> C8
+    C10 --> C1
+    C10 --> C5
+    C10 --> C6
+    C10 --> C8
+    C10 --> C9
+    C11 --> C2
+    C11 --> C3
+    C11 --> C4
+    C11 --> C5
+    C11 --> C6
+    C11 --> C7
+    C11 --> C8
+    C11 --> C9
+    C11 --> C10
 ```
 
 开发节奏建议：
 
 1. 先冻结 Shard 1 的头文件、结构体、错误码和协议格式，允许后续 shard 基于稳定契约并行开发。
-2. Shard 2 至 7 可在契约冻结后并行推进；接口未完成时可先用 fake ViewServer、fake Agent ABI 或 fake HTTP 服务联调。
-3. Shard 8 最后执行分支合并、默认工厂切换、旧配置路径回归和端到端集成测试，确保 `view.provider` 未设置时旧行为完全不变。
+2. Shard 2 至 8 可在契约冻结后并行推进；Shard 7 与 8 无直接依赖，9 依赖 8，10 依赖 5、6、8 和 9。
+3. 外部 IO API 携带 `KvNsId` 的分支是 Shard 9 的前置条件；若该分支尚未合入，9 只能先完成内部结构与非 IO 路径的单测。
+4. Shard 11 最后执行分支合并、默认工厂切换、旧配置路径回归和端到端集成测试，确保 `view.provider` 未设置时旧行为完全不变。
