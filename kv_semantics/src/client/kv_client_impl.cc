@@ -33,13 +33,19 @@
 #include "kv_metrics/metrics.h"
 #include "kv_types.h"
 #include "logger.h"
+#include "parser_common.h"
 #include "router/config.h"
 #include "router/router.h"
 #include "utils/config_utils.h"
+#include "view/threaded_refresh_scheduler.h"
 
 namespace kv {
 
 namespace {
+
+constexpr std::uint64_t kDefaultRefreshIntervalMs = 30000;
+constexpr std::uint64_t kMaxRefreshIntervalMs =
+    static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max());
 
 struct SubmitMetrics {
     metrics::CachedMetric* requests;
@@ -89,6 +95,29 @@ void RecordSubmit(AsuOpType opType, std::size_t entryCount, const Status& status
     metrics::UpdateStats(updates, status.ok() ? std::size(updates) - 1 : std::size(updates));
 }
 
+Status ParseRefreshInterval(const KvClientConfig& config, std::uint64_t& refreshIntervalMs)
+{
+    refreshIntervalMs = kDefaultRefreshIntervalMs;
+    const auto iter = config.attrs.find("view.refresh_interval_ms");
+    if (iter == config.attrs.end()) { return Status::OK(); }
+
+    const auto value = TrimConfigValue(iter->second);
+    if (value.empty() || value.find('\0') != std::string::npos || value.front() == '-') {
+        return Status::Error(StatusCode::INVALID_ARGUMENT,
+                             "view.refresh_interval_ms must be a valid interval in milliseconds");
+    }
+
+    constexpr auto invalid = std::numeric_limits<std::uint64_t>::max();
+    const auto parsed = ParseConfigUint64(value, invalid);
+    if (parsed == invalid || parsed == 0 || parsed > kMaxRefreshIntervalMs) {
+        return Status::Error(
+            StatusCode::INVALID_ARGUMENT,
+            "view.refresh_interval_ms must be between 1 and " + std::to_string(kMaxRefreshIntervalMs));
+    }
+    refreshIntervalMs = parsed;
+    return Status::OK();
+}
+
 }  // namespace
 
 constexpr std::uint32_t kMaxShutdownDrainAttempts = 64;
@@ -117,6 +146,9 @@ Status KvClientImpl::Init(const KvClientConfig& config)
     }
 
     config_ = config;
+    std::uint64_t refreshIntervalMs{0};
+    const auto intervalStatus = ParseRefreshInterval(config, refreshIntervalMs);
+    if (!intervalStatus.ok()) { return intervalStatus; }
     viewServer_ = viewServerFactory_(config);
     if (viewServer_ == nullptr) {
         return Status::Error(StatusCode::NOT_INITIALIZED, "view server factory returned null");
@@ -162,24 +194,37 @@ Status KvClientImpl::Init(const KvClientConfig& config)
     stopWorker_.store(false, std::memory_order_release);
     worker_ = std::thread(&KvClientImpl::WorkerLoop, this);
     snapshot_ = std::move(nextSnapshot);
+    shutdownRequested_ = false;
     initialized_ = true;
+    refreshScheduler_ = std::make_unique<ThreadedRefreshScheduler>();
+    const auto schedulerStatus = refreshScheduler_->Start(
+        std::chrono::milliseconds{refreshIntervalMs}, [this] { return RefreshView(); });
+    if (!schedulerStatus.ok()) {
+        const auto failureStatus = schedulerStatus;
+        const auto shutdownStatus = Shutdown();
+        (void)shutdownStatus;
+        return failureStatus;
+    }
     return Status::OK();
 }
 
 Status KvClientImpl::Shutdown()
 {
     std::uint64_t waitTimeoutMs = 0;
+    std::unique_ptr<RefreshScheduler> refreshScheduler;
     {
         std::lock_guard<std::mutex> lock{mutex_};
+        shutdownRequested_ = true;
         initialized_ = false;
         waitTimeoutMs = config_.defaultWaitTimeoutMs;
+        refreshScheduler = std::move(refreshScheduler_);
     }
+    if (refreshScheduler != nullptr) { refreshScheduler->Stop(); }
     {
         std::lock_guard<std::mutex> lock{producerMu_};
         stopWorker_.store(true, std::memory_order_release);
     }
     workerCv_.notify_one();
-    JoinBackgroundRefresh();
     if (worker_.joinable()) { worker_.join(); }
 
     std::shared_ptr<ViewSnapshot> snapshot;
@@ -791,7 +836,7 @@ Status KvClientImpl::RefreshView()
     std::shared_ptr<ViewSnapshot> oldSnapshot;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (!initialized_ && !refreshInProgress_) { return NotInitialized(); }
+        if (!initialized_ && !shutdownRequested_) { return NotInitialized(); }
         viewServer = viewServer_;
         oldSnapshot = snapshot_;
     }
@@ -804,7 +849,7 @@ Status KvClientImpl::RefreshView()
     if (!status.ok()) { return status; }
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (!initialized_ && !refreshInProgress_) { return NotInitialized(); }
+        if (!initialized_ && !shutdownRequested_) { return NotInitialized(); }
         if (snapshot_ != nullptr && !viewServer->ShouldPublishView(snapshot_->view, view)) {
             return Status::OK();
         }
@@ -816,7 +861,7 @@ Status KvClientImpl::RefreshView()
 
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (!initialized_ && !refreshInProgress_) { return NotInitialized(); }
+        if (!initialized_ && !shutdownRequested_) { return NotInitialized(); }
         if (snapshot_ != nullptr && !viewServer->ShouldPublishView(snapshot_->view, view)) {
             return Status::OK();
         }
@@ -835,34 +880,18 @@ Status KvClientImpl::RefreshView()
 
 void KvClientImpl::RequestBackgroundRefresh()
 {
-    std::thread completedThread;
+    RefreshScheduler* scheduler = nullptr;
     {
         std::lock_guard<std::mutex> lock{mutex_};
-        if (!initialized_ || refreshInProgress_) { return; }
-        completedThread = std::move(refreshThread_);
-        refreshInProgress_ = true;
-        refreshThread_ = std::thread([this] {
-            const auto status = RefreshView();
-            if (!status.ok()) {
-                KV_WARN("Background view refresh failed: code={} message={}",
-                        static_cast<int>(status.code), status.message);
-            }
-            std::lock_guard<std::mutex> lock{mutex_};
-            refreshInProgress_ = false;
-        });
+        if (!initialized_) { return; }
+        scheduler = refreshScheduler_.get();
+        if (scheduler == nullptr) { return; }
+        // Stop cannot remove the scheduler while mutex_ is held. Triggering
+        // under mutex_ guarantees the IO-failure refresh is accepted before
+        // Shutdown starts draining the scheduler.
+        scheduler->TriggerByIoFailure(
+            Status::Error(StatusCode::IO_ERROR, "view refresh requested"));
     }
-
-    if (completedThread.joinable()) { completedThread.join(); }
-}
-
-void KvClientImpl::JoinBackgroundRefresh()
-{
-    std::thread refreshThread;
-    {
-        std::lock_guard<std::mutex> lock{mutex_};
-        refreshThread = std::move(refreshThread_);
-    }
-    if (refreshThread.joinable()) { refreshThread.join(); }
 }
 
 Status KvClientImpl::ShutdownSnapshotTransports(const std::shared_ptr<ViewSnapshot>& snapshot)
