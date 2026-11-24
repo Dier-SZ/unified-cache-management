@@ -2,12 +2,16 @@
 
 set -Eeuo pipefail
 
+unset LD_PRELOAD
+export LD_LIBRARY_PATH="/mnt/models/L2-ceph-monitor/ceph/build/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export CEPH_DEV=1
+
 # Ceph的Cmake构建目录。留空表示执行脚本时的当前目录
 # 也可以通过第三个命令行参数覆盖
 # 例如： CEPH_BUILD_DIR="/root/ceph/build_kvmon"
 CEPH_BUILD_DIR=''
 # 注册的ISD数量；也可以通过第一个命令行参数覆盖
-OSD_COUN=4
+OSD_COUNT=4
 # 第一个OSD ID，后续依次递增
 OSD_ID_START=0
 #留空是自动选择本机第一个IPV4地址，也可以通过第二个参数覆盖
@@ -32,7 +36,7 @@ STATE_DIR_NAME="manual-ceph"
 RESULT_FILE_NAME="bootstrap_result.txt"
 
 die() {
-    echo "ERRORL $*" >&2
+    echo "ERROR: $*" >&2
     exit 1
 }
 
@@ -58,8 +62,8 @@ detect_mon_ip() {
         detected=$(ip -o -4 addr show scope global 2>/dev/null | awk 'NR == 1 {split($4, a, "/"); print a[1]}')
     fi
 
-    [[ -n "detected" ]] || die "无法自动检测MON_IP请在脚本开头设置MON_IP"
-    printf '%s\n' "detected"
+    [[ -n "$detected" ]] || die "无法自动检测MON_IP请在脚本开头设置MON_IP"
+    printf '%s\n' "$detected"
 }
 
 stop_all_ceph_mon() {
@@ -174,7 +178,7 @@ command -v pgrep >/dev/null 2>&1 || die "找不到 pgrep"
 
 [[ -f "$ERASURE_CODE_DIR/libec_jerasure.so" ]] || \
     die "找不到纠删码插件：$ERASURE_CODE_DIR/libec_jerasure.so"
-[[ -d "PLUGIN_DIR" ]] || die "插件目录不存在 $PLUGIN_DIR"
+[[ -d "$PLUGIN_DIR" ]] || die "插件目录不存在 $PLUGIN_DIR"
 
 if [[ -n "${LD_LIBRARY_PATH:-}" ]]; then
     export LD_LIBRARY_PATH="$BUILD_DIR/lib:$BUILD_DIR/external/lib:$LD_LIBRARY_PATH"
@@ -209,7 +213,7 @@ FSID=$(new_uuid)
     printf 'auth_client_required = cephx\n'
     printf '\n[mon.%s]\n' "$MON_ID"
     printf 'mon_data = %s\n' "$MON_DATA"
-    printf 'admin_soket = %s\n' "$MON_ASOK"
+    printf 'admin_socket = %s\n' "$MON_ASOK"
     printf 'log_file = %s\n' "$MON_LOG"
     printf 'pid_file = %s\n' "$MON_PID_FILE"
     printf '\n[client.admin]\n'
@@ -222,7 +226,7 @@ FSID=$(new_uuid)
     -n mon.
 
 "$CEPH_AUTHTOOL" \
-    --create-keyring "$MON_KEYRING" \
+    --create-keyring "$ADMIN_KEYRING" \
     --gen-key \
     -n client.admin \
     --cap mon 'allow *' \
@@ -240,7 +244,7 @@ FSID=$(new_uuid)
 
 "$CEPH_MON" \
     -i "$MON_ID" \
-    -c "$CEPH_MON" \
+    -c "$CEPH_CONF" \
     --mkfs \
     --monmap "$MONMAP" \
     --keyring "$MON_KEYRING"
@@ -248,7 +252,7 @@ FSID=$(new_uuid)
 echo "正在启动 mon.$MON_ID ..."
 nohup "$CEPH_MON" \
     -i "$MON_ID" \
-    -c "$CEPH_MON" \
+    -c "$CEPH_CONF" \
     -f \
     </dev/null \
     >>"$MON_CONSOLE_LOG" 2>&1 &
@@ -258,21 +262,25 @@ echo "mon.$MON_ID 后台进程 PID：$MON_PID"
 
 CEPH_ARGS=(
     "$CEPH"
-    -c "$CEPH_MON"
+    -c "$CEPH_CONF"
     -n client.admin
     -k "$ADMIN_KEYRING"
 )
 
 MON_READY=0
-for ((attempt = 1; attempt <= 30; attempt++)); do
+MON_PROBE_RC=0
+MON_PROBE_OUTPUT=""
+for ((attempt = 1; attempt <= 120; attempt++)); do
     if ! kill -0 "$MON_PID" 2>/dev/null; then
         echo "mon.$MON_ID  进程已经提前退出。" >&2
         break
     fi
 
-    if timeout 3 "${CEPH_ARGS[@]}" mon stat >/dev/null 2>&1; then
+    if MON_PROBE_OUTPUT=$(timeout 3 "${CEPH_ARGS[@]}" mon stat 2>&1); then
         MON_READY=1
         break
+    else
+        MON_PROBE_RC=$?
     fi
     sleep 1
 done
@@ -284,6 +292,11 @@ if ((MON_READY == 0)); then
     wait "$MON_PID" 2>/dev/null || true
 
     echo "mon.$MON_ID 未能在30秒内进入可以访问的状态。" >&2
+    if ((MON_PROBE_RC != 0)); then
+        echo "ceph mon stat 最后一次探测退出码：$MON_PROBE_RC" >&2
+        echo "ceph mon stat 最后一次探测输出：" >&2
+        printf '%s\n' "$MON_PROBE_OUTPUT" >&2
+    fi
     echo "控制台日志最后50行：" >&2
     if [[ -f "$MON_CONSOLE_LOG" ]]; then
         tail -n 50 "$MON_CONSOLE_LOG" >&2
@@ -339,7 +352,7 @@ for ((index = 0; index < OSD_COUNT; index++)); do
         die "注册osd.$osd_id 后返回了意外 ID：$created_id"
 
     if ! timeout 10 "${CEPH_ARGS[@]}" osd out "$osd_id" >/dev/null; then
-        die "将注册的osd.$osd_id 标记为ou失败或者超时"
+        die "将注册的osd.$osd_id 标记为out失败或者超时"
     fi
 
     OSD_IDS+=("$osd_id")
@@ -353,26 +366,26 @@ done
     printf 'mon_host = %s\n' "$MON_HOST"
     printf 'mon_osd_report_timeout = %s\n' "$MON_OSD_REPORT_TIMEOUT"
     printf 'mon_osd_down_out_interval = %s\n' "$MON_OSD_DOWN_OUT_INTERVAL"
-    printf 'mon_osd_min_up_ratio = &s\n' "$MON_OSD_MIN_UP_RATIO"
-    printf 'mon_osd_min_in_ratio = &s\n' "$MON_OSD_MIN_IN_RATIO"
-    printf 'mon_max_pg_per_osd = &s\n' "$MON_MAX_PG_PER_OSD"
+    printf 'mon_osd_min_up_ratio = %s\n' "$MON_OSD_MIN_UP_RATIO"
+    printf 'mon_osd_min_in_ratio = %s\n' "$MON_OSD_MIN_IN_RATIO"
+    printf 'mon_max_pg_per_osd = %s\n' "$MON_MAX_PG_PER_OSD"
 
     printf '\nOSD:\n'
     for ((index = 0; index < OSD_COUNT; index++)); do
         output_index=$((index + 1))
-        printf 'osd_id_%d = &s\n' "$output_index" "${OSD_IDS[$index]}"
-        printf 'osd_key_%d = &s\n' "$output_index" "${OSD_KEYS[$index]}"
-        printf 'osd_uuid_%d = &s\n' "$output_index" "${OSD_UUIDS[$index]}"
+        printf 'osd_id_%d = %s\n' "$output_index" "${OSD_IDS[$index]}"
+        printf 'osd_key_%d = %s\n' "$output_index" "${OSD_KEYS[$index]}"
+        printf 'osd_uuid_%d = %s\n' "$output_index" "${OSD_UUIDS[$index]}"
     done
 
     printf '\nothers:\n'
     printf 'ceph_build_dir = %s\n' "$BUILD_DIR"
     printf 'fsid = %s\n' "$FSID"
     printf 'ceph_conf = %s\n' "$CEPH_CONF"
-    printf 'mon_pid_file = &s\n' "$MON_PID_FILE"
-    printf 'mon_log = &s\n' "$MON_LOG"
-    printf 'mon_console_log = &s\n' "$MON_CONSOLE_LOG"
-    printf 'result_file = &s\n' "$RESULT_FILE"
+    printf 'mon_pid_file = %s\n' "$MON_PID_FILE"
+    printf 'mon_log = %s\n' "$MON_LOG"
+    printf 'mon_console_log = %s\n' "$MON_CONSOLE_LOG"
+    printf 'result_file = %s\n' "$RESULT_FILE"
     printf '=====================================================\n'
 } | tee "$RESULT_FILE"
 
